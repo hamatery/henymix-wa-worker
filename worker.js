@@ -17,12 +17,16 @@ http
     console.log(`Health server listening on port ${PORT}`);
   });
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_URL = (
+  process.env.SUPABASE_URL || "https://syxibiyrbgwsgghwwgej.supabase.co"
+).trim();
+const SUPABASE_SERVICE_ROLE_KEY = (
+  process.env.SUPABASE_SERVICE_ROLE_KEY || ""
+).trim();
 const FUNCTION_URL = `${SUPABASE_URL}/functions/v1/yumilo-assistant`;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables.");
+if (!SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("Missing SUPABASE_SERVICE_ROLE_KEY environment variable.");
   process.exit(1);
 }
 
