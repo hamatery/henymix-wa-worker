@@ -1,3 +1,4 @@
+import http from "node:http";
 import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
@@ -5,6 +6,16 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import { createClient } from "@supabase/supabase-js";
 import pino from "pino";
+
+const PORT = process.env.PORT || 3000;
+http
+  .createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("Henymix WhatsApp Worker is running\n");
+  })
+  .listen(PORT, () => {
+    console.log(`Health server listening on port ${PORT}`);
+  });
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
