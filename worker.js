@@ -101,14 +101,18 @@ function extractMentionedJids(msg) {
 
 function shouldReplyToMessage({ msg, sock, sessionRow, text }) {
   const remoteJid = msg.key?.remoteJid || "";
-  if (!remoteJid || remoteJid === "status@broadcast") return false;
-  if (msg.key?.fromMe) return false;
+  if (!remoteJid || remoteJid === "status@broadcast") return { ok: false, reason: "status_or_empty" };
+  if (msg.key?.fromMe) return { ok: false, reason: "fromMe_true" };
 
   const isGroup = remoteJid.endsWith("@g.us");
-  if (isGroup && sessionRow.reply_in_groups === false) return false;
-  if (!isGroup && sessionRow.reply_in_dms === false) return false;
+  if (isGroup && sessionRow.reply_in_groups === false) {
+    return { ok: false, reason: "reply_in_groups_false" };
+  }
+  if (!isGroup && sessionRow.reply_in_dms === false) {
+    return { ok: false, reason: "reply_in_dms_false" };
+  }
 
-  if (!isGroup) return true;
+  if (!isGroup) return { ok: true, reason: "dm_allowed" };
 
   const botDigits = normalizeDigits(sock.user?.id || sessionRow.phone_number);
   const botLidDigits = normalizeDigits(sock.user?.lid || "");
@@ -119,7 +123,7 @@ function shouldReplyToMessage({ msg, sock, sessionRow, text }) {
     return (botDigits && d === botDigits) || (botLidDigits && d === botLidDigits);
   });
 
-  if (isTaggedDirectly) return true;
+  if (isTaggedDirectly) return { ok: true, reason: "mentioned_jid_match" };
 
   const keywords = String(sessionRow.trigger_keywords || "@henymix, henymix")
     .split(",")
@@ -127,7 +131,13 @@ function shouldReplyToMessage({ msg, sock, sessionRow, text }) {
     .filter(Boolean);
 
   const lowerText = text.toLowerCase();
-  return keywords.some((kw) => lowerText.includes(kw));
+  const matchedKw = keywords.find((kw) => lowerText.includes(kw));
+  if (matchedKw) return { ok: true, reason: `keyword:${matchedKw}` };
+
+  return {
+    ok: false,
+    reason: `no_match (mentioned=${JSON.stringify(mentionedJids)}, bot=${botDigits}, lid=${botLidDigits})`
+  };
 }
 
 async function restoreAuthFolderFromSupabase(userId, authDir) {
@@ -225,7 +235,7 @@ async function startSessionForUser(sessionRow) {
             updated_at: new Date().toISOString()
           })
           .eq("user_id", userId);
-        console.log(`WhatsApp connected for user ${userId}`);
+        console.log(`WhatsApp connected for user ${userId} (jid=${sock.user?.id || ""}, lid=${sock.user?.lid || ""})`);
       } else if (connection === "close") {
         activeSockets.delete(userId);
         const statusCode = lastDisconnect?.error?.output?.statusCode;
@@ -263,7 +273,10 @@ async function startSessionForUser(sessionRow) {
             .maybeSingle();
 
           const activeCfg = latestSession || sessionRow;
-          if (!shouldReplyToMessage({ msg, sock, sessionRow: activeCfg, text: rawText })) {
+          const decision = shouldReplyToMessage({ msg, sock, sessionRow: activeCfg, text: rawText });
+          console.log(`[WA MSG] chat=${msg.key?.remoteJid} fromMe=${msg.key?.fromMe} text="${rawText}" -> ${decision.reason}`);
+
+          if (!decision.ok) {
             continue;
           }
 
@@ -289,7 +302,16 @@ async function startSessionForUser(sessionRow) {
             })
           });
 
-          const data = await fnRes.json();
+          const rawBody = await fnRes.text();
+          let data = {};
+          try {
+            data = JSON.parse(rawBody);
+          } catch {
+            console.error(`[FN NON-JSON] status=${fnRes.status} body=${rawBody.slice(0, 300)}`);
+          }
+
+          console.log(`[FN RESULT] status=${fnRes.status} hasReply=${Boolean(data?.reply)}`);
+
           const replyText = data?.reply;
           const imageUrls = Array.isArray(data?.images)
             ? data.images
@@ -299,6 +321,7 @@ async function startSessionForUser(sessionRow) {
 
           if (replyText) {
             await sock.sendMessage(remoteJid, { text: replyText }, { quoted: msg });
+            console.log(`[WA SENT] to=${remoteJid}`);
           }
 
           for (const imgUrl of imageUrls) {
