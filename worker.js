@@ -9,13 +9,24 @@ import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
 
+const DEFAULT_SUPABASE_URL = 'https://syxibiyrbgwsgghwwgej.supabase.co';
 const cleanEnv = (val) => String(val || '').trim().replace(/^["']|["']$/g, '');
 
-const SUPABASE_URL =
-  cleanEnv(process.env.SUPABASE_URL) ||
-  cleanEnv(process.env.VITE_SUPABASE_URL) ||
-  cleanEnv(process.env.NEXT_PUBLIC_SUPABASE_URL) ||
-  'https://syxibiyrbgwsgghwwgej.supabase.co';
+function pickValidUrl(...candidates) {
+  for (const raw of candidates) {
+    const cleaned = cleanEnv(raw);
+    if (/^https?:\/\/.+/i.test(cleaned)) {
+      return cleaned.replace(/\/+$/, '');
+    }
+  }
+  return DEFAULT_SUPABASE_URL;
+}
+
+const SUPABASE_URL = pickValidUrl(
+  process.env.SUPABASE_URL,
+  process.env.VITE_SUPABASE_URL,
+  process.env.NEXT_PUBLIC_SUPABASE_URL
+);
 
 const SUPABASE_KEY =
   cleanEnv(process.env.SUPABASE_SERVICE_ROLE_KEY) ||
@@ -23,9 +34,10 @@ const SUPABASE_KEY =
   cleanEnv(process.env.SUPABASE_SERVICE_KEY) ||
   cleanEnv(process.env.SUPABASE_ANON_KEY);
 
-const SUPABASE_FUNCTION_URL =
-  cleanEnv(process.env.SUPABASE_FUNCTION_URL) ||
-  `${SUPABASE_URL}/functions/v1/yumilo-assistant`;
+const rawFnUrl = cleanEnv(process.env.SUPABASE_FUNCTION_URL);
+const SUPABASE_FUNCTION_URL = /^https?:\/\/.+/i.test(rawFnUrl)
+  ? rawFnUrl
+  : `${SUPABASE_URL}/functions/v1/yumilo-assistant`;
 
 const POLL_INTERVAL_MS = Number(cleanEnv(process.env.POLL_INTERVAL_MS) || 4000);
 const AUTH_BASE_DIR = cleanEnv(process.env.AUTH_BASE_DIR) || './auth_sessions';
