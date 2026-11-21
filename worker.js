@@ -1,5 +1,6 @@
 import express from "express";
 import makeWASocket, {
+  Browsers,
   DisconnectReason,
   fetchLatestBaileysVersion,
   useMultiFileAuthState
@@ -74,7 +75,7 @@ const logger = pino({ level: "silent" });
 
 const activeSockets = new Map();
 const startingUsers = new Set();
-const pairingAttempted = new Map(); // userId -> { phone, time }
+const pairingAttempted = new Map();
 
 function normalizeDigits(jidOrPhone) {
   return String(jidOrPhone || "")
@@ -217,7 +218,7 @@ async function startSessionForUser(sessionRow) {
       auth: state,
       logger,
       printQRInTerminal: false,
-      browser: ["Henymix", "Chrome", "124.0.0"]
+      browser: Browsers.ubuntu("Chrome")
     });
 
     activeSockets.set(userId, sock);
@@ -235,7 +236,7 @@ async function startSessionForUser(sessionRow) {
     const cleanPhone = normalizeDigits(sessionRow.phone_number);
     const existingCode = typeof sessionRow.pairing_code === "string" ? sessionRow.pairing_code.trim() : "";
     const prevAttempt = pairingAttempted.get(userId);
-    const cooldownMs = 120000; // Wait at least 2 minutes before issuing another pairing code
+    const cooldownMs = 120000;
 
     const canRequestNewCode =
       !sock.authState.creds.registered &&
@@ -287,6 +288,7 @@ async function startSessionForUser(sessionRow) {
           activeSockets.delete(userId);
           const statusCode = lastDisconnect?.error?.output?.statusCode;
           const loggedOut = statusCode === DisconnectReason.loggedOut;
+          console.log(`WhatsApp connection closed for user ${userId} (statusCode=${statusCode || "unknown"}, loggedOut=${loggedOut})`);
 
           if (loggedOut) {
             pairingAttempted.delete(userId);
