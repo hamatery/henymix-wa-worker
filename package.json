@@ -3,12 +3,16 @@
   "version": "1.0.0",
   "type": "module",
   "main": "worker.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node worker.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.0",
-    "@whiskeysockets/baileys": "^6.7.0",
-    "pino": "^9.0.0"
+    "@supabase/supabase-js": "^2.119.0",
+    "@whiskeysockets/baileys": "^6.7.24",
+    "express": "^4.21.2",
+    "pino": "^9.5.0"
   }
 }
