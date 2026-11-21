@@ -9,6 +9,14 @@ import pino from "pino";
 import fs from "fs";
 import path from "path";
 
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled Rejection:", err?.message || err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught Exception:", err?.message || err);
+});
+
 const app = express();
 app.use(express.json());
 
@@ -66,6 +74,7 @@ const logger = pino({ level: "silent" });
 
 const activeSockets = new Map();
 const startingUsers = new Set();
+const pairingAttempted = new Map(); // userId -> { phone, time }
 
 function normalizeDigits(jidOrPhone) {
   return String(jidOrPhone || "")
@@ -141,17 +150,28 @@ function shouldReplyToMessage({ msg, sock, sessionRow, text }) {
 }
 
 async function restoreAuthFolderFromSupabase(userId, authDir) {
-  fs.mkdirSync(authDir, { recursive: true });
-  const { data } = await supabase
-    .from("whatsapp_sessions")
-    .select("auth_creds")
-    .eq("user_id", userId)
-    .maybeSingle();
+  try {
+    fs.mkdirSync(authDir, { recursive: true });
+    const { data, error } = await supabase
+      .from("whatsapp_sessions")
+      .select("auth_creds")
+      .eq("user_id", userId)
+      .maybeSingle();
 
-  if (data?.auth_creds && typeof data.auth_creds === "object") {
-    for (const [fileName, content] of Object.entries(data.auth_creds)) {
-      fs.writeFileSync(path.join(authDir, fileName), JSON.stringify(content));
+    if (error) {
+      console.error("Auth restore query error:", error.message);
+      return;
     }
+
+    if (data?.auth_creds && typeof data.auth_creds === "object") {
+      for (const [fileName, content] of Object.entries(data.auth_creds)) {
+        if (!fileName || content === undefined || content === null) continue;
+        const safeName = path.basename(fileName);
+        fs.writeFileSync(path.join(authDir, safeName), JSON.stringify(content));
+      }
+    }
+  } catch (err) {
+    console.error("Auth restore error:", err.message);
   }
 }
 
@@ -162,13 +182,17 @@ async function backupAuthFolderToSupabase(userId, authDir) {
     const bundle = {};
     for (const f of files) {
       if (!f.endsWith(".json")) continue;
-      const raw = fs.readFileSync(path.join(authDir, f), "utf8");
-      bundle[f] = JSON.parse(raw);
+      const fullPath = path.join(authDir, f);
+      if (!fs.existsSync(fullPath)) continue;
+      const raw = fs.readFileSync(fullPath, "utf8");
+      if (raw) bundle[f] = JSON.parse(raw);
     }
-    await supabase
-      .from("whatsapp_sessions")
-      .update({ auth_creds: bundle, updated_at: new Date().toISOString() })
-      .eq("user_id", userId);
+    if (Object.keys(bundle).length > 0) {
+      await supabase
+        .from("whatsapp_sessions")
+        .update({ auth_creds: bundle, updated_at: new Date().toISOString() })
+        .eq("user_id", userId);
+    }
   } catch (err) {
     console.error("Auth backup error:", err.message);
   }
@@ -183,6 +207,8 @@ async function startSessionForUser(sessionRow) {
 
   try {
     await restoreAuthFolderFromSupabase(userId, authDir);
+    fs.mkdirSync(authDir, { recursive: true });
+
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -197,14 +223,33 @@ async function startSessionForUser(sessionRow) {
     activeSockets.set(userId, sock);
 
     sock.ev.on("creds.update", async () => {
-      await saveCreds();
-      await backupAuthFolderToSupabase(userId, authDir);
+      try {
+        fs.mkdirSync(authDir, { recursive: true });
+        await saveCreds();
+        await backupAuthFolderToSupabase(userId, authDir);
+      } catch (err) {
+        console.error("creds.update error:", err.message);
+      }
     });
 
-    if (!sock.authState.creds.registered && sessionRow.phone_number) {
+    const cleanPhone = normalizeDigits(sessionRow.phone_number);
+    const existingCode = typeof sessionRow.pairing_code === "string" ? sessionRow.pairing_code.trim() : "";
+    const prevAttempt = pairingAttempted.get(userId);
+    const cooldownMs = 120000; // Wait at least 2 minutes before issuing another pairing code
+
+    const canRequestNewCode =
+      !sock.authState.creds.registered &&
+      cleanPhone &&
+      (!existingCode || existingCode.toUpperCase() === "PENDING") &&
+      (!prevAttempt ||
+        prevAttempt.phone !== cleanPhone ||
+        Date.now() - prevAttempt.time > cooldownMs);
+
+    if (canRequestNewCode) {
+      pairingAttempted.set(userId, { phone: cleanPhone, time: Date.now() });
       setTimeout(async () => {
         try {
-          const cleanPhone = normalizeDigits(sessionRow.phone_number);
+          if (sock.authState.creds.registered) return;
           const code = await sock.requestPairingCode(cleanPhone);
           const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code;
           await supabase
@@ -223,38 +268,44 @@ async function startSessionForUser(sessionRow) {
     }
 
     sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect } = update;
+      try {
+        const { connection, lastDisconnect } = update;
 
-      if (connection === "open") {
-        await backupAuthFolderToSupabase(userId, authDir);
-        await supabase
-          .from("whatsapp_sessions")
-          .update({
-            status: "connected",
-            pairing_code: null,
-            updated_at: new Date().toISOString()
-          })
-          .eq("user_id", userId);
-        console.log(`WhatsApp connected for user ${userId} (jid=${sock.user?.id || ""}, lid=${sock.user?.lid || ""})`);
-      } else if (connection === "close") {
-        activeSockets.delete(userId);
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const loggedOut = statusCode === DisconnectReason.loggedOut;
-
-        if (loggedOut) {
-          fs.rmSync(authDir, { recursive: true, force: true });
+        if (connection === "open") {
+          pairingAttempted.delete(userId);
+          await backupAuthFolderToSupabase(userId, authDir);
           await supabase
             .from("whatsapp_sessions")
             .update({
-              status: "logged_out",
+              status: "connected",
               pairing_code: null,
-              auth_creds: null,
               updated_at: new Date().toISOString()
             })
             .eq("user_id", userId);
-        } else {
-          setTimeout(() => syncSessionsFromSupabase(), 4000);
+          console.log(`WhatsApp connected for user ${userId} (jid=${sock.user?.id || ""}, lid=${sock.user?.lid || ""})`);
+        } else if (connection === "close") {
+          activeSockets.delete(userId);
+          const statusCode = lastDisconnect?.error?.output?.statusCode;
+          const loggedOut = statusCode === DisconnectReason.loggedOut;
+
+          if (loggedOut) {
+            pairingAttempted.delete(userId);
+            fs.rmSync(authDir, { recursive: true, force: true });
+            await supabase
+              .from("whatsapp_sessions")
+              .update({
+                status: "logged_out",
+                pairing_code: null,
+                auth_creds: null,
+                updated_at: new Date().toISOString()
+              })
+              .eq("user_id", userId);
+          } else {
+            setTimeout(() => syncSessionsFromSupabase(), 5000);
+          }
         }
+      } catch (err) {
+        console.error("connection.update error:", err.message);
       }
     });
 
@@ -336,6 +387,8 @@ async function startSessionForUser(sessionRow) {
         }
       }
     });
+  } catch (err) {
+    console.error("startSessionForUser error:", err.message);
   } finally {
     startingUsers.delete(userId);
   }
