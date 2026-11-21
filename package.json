@@ -4,13 +4,13 @@
   "type": "module",
   "main": "worker.js",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "start": "node worker.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.119.0",
+    "@supabase/supabase-js": "^2.119.2",
     "@whiskeysockets/baileys": "^6.7.24",
     "express": "^4.21.2",
     "pino": "^9.5.0"
