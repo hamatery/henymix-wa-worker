@@ -34,7 +34,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const logger = pino({ level: 'silent' });
 const activeSessions = new Map();
 const processedMsgIds = new Set();
-const chatHistoryCache = new Map();
+const bootTimeSec = Math.floor(Date.now() / 1000);
 
 function sanitizePhone(phone) {
   return String(phone || '').replace(/\D/g, '');
@@ -42,27 +42,10 @@ function sanitizePhone(phone) {
 
 function formatForWhatsApp(text) {
   return String(text || '')
-    // Convert ### Heading to WhatsApp *Heading*
     .replace(/^#{1,6}\s+(.+)$/gm, (_, title) => `*${title.replace(/\*/g, '').trim()}*`)
-    // Convert **bold** to WhatsApp *bold*
     .replace(/\*\*(.+?)\*\*/g, '*$1*')
-    // Convert Markdown "* " or "- " bullets to clean "• " bullets
     .replace(/^\s*[\*\-]\s+/gm, '• ')
     .trim();
-}
-
-function getRecentChatHistory(chatKey) {
-  return chatHistoryCache.get(chatKey) || [];
-}
-
-function appendChatHistory(chatKey, role, content) {
-  const history = chatHistoryCache.get(chatKey) || [];
-  history.push({ role, content });
-  // Keep the last 10 turns per WhatsApp chat for follow-up questions
-  if (history.length > 10) {
-    history.splice(0, history.length - 10);
-  }
-  chatHistoryCache.set(chatKey, history);
 }
 
 async function updateSessionRow(userId, fields) {
@@ -79,7 +62,6 @@ async function updateSessionRow(userId, fields) {
   }
 }
 
-// Store Baileys auth state directly in whatsapp_sessions.auth_state (jsonb)
 async function useRowAuthState(userId, reset = false) {
   let store = { creds: initAuthCreds(), keys: {} };
 
@@ -311,6 +293,11 @@ async function startSession(sessionRow, forceFreshPair = false) {
     for (const msg of messages) {
       if (!msg.message) continue;
 
+      const msgTimestamp = Number(msg.messageTimestamp || 0);
+      if (msgTimestamp > 0 && msgTimestamp < bootTimeSec - 15) {
+        continue;
+      }
+
       const msgId = msg.key?.id;
       if (msgId) {
         if (processedMsgIds.has(msgId)) continue;
@@ -372,8 +359,7 @@ async function startSession(sessionRow, forceFreshPair = false) {
       const cleanedPrompt =
         text.replace(new RegExp(`@${myNumber}\\b`, 'g'), '').trim() || text;
 
-      const chatKey = `${userId}:${remoteJid}`;
-      const history = getRecentChatHistory(chatKey);
+      console.log(`[${userId}] Triggered by: "${cleanedPrompt}"`);
 
       try {
         await sock.sendPresenceUpdate('composing', remoteJid);
@@ -385,7 +371,6 @@ async function startSession(sessionRow, forceFreshPair = false) {
           {
             body: {
               message: cleanedPrompt,
-              history,
               user_id: userId,
               sender: senderJid,
               is_group: isGroup,
@@ -395,7 +380,7 @@ async function startSession(sessionRow, forceFreshPair = false) {
         );
 
         if (fnError) {
-          console.error(`[${userId}] yumilo-assistant error for "${cleanedPrompt}":`, fnError);
+          console.error(`[${userId}] yumilo-assistant error:`, fnError);
           continue;
         }
 
@@ -403,20 +388,16 @@ async function startSession(sessionRow, forceFreshPair = false) {
           fnData?.reply || fnData?.response || fnData?.message || fnData?.text;
 
         if (!replyText || !String(replyText).trim()) {
-          console.warn(`[${userId}] Empty reply from yumilo-assistant for "${cleanedPrompt}"`);
+          console.warn(`[${userId}] Empty reply from yumilo-assistant:`, fnData);
           continue;
         }
 
-        const formattedReply = formatForWhatsApp(replyText);
-
-        appendChatHistory(chatKey, 'user', cleanedPrompt);
-        appendChatHistory(chatKey, 'assistant', formattedReply);
-
         await sock.sendMessage(
           remoteJid,
-          { text: formattedReply },
+          { text: formatForWhatsApp(replyText) },
           { quoted: msg }
         );
+        console.log(`[${userId}] Replied successfully to ${remoteJid}`);
       } catch (err) {
         console.error(`[${userId}] Auto-reply failed:`, err);
       } finally {
