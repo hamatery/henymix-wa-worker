@@ -9,7 +9,6 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
 } from '@whiskeysockets/baileys';
 
-// 1. Health server for Render
 const PORT = process.env.PORT || 3000;
 http
   .createServer((req, res) => {
@@ -20,7 +19,6 @@ http
     console.log(`Health server listening on port ${PORT}`);
   });
 
-// 2. Supabase setup
 const rawUrl = (process.env.SUPABASE_URL || '').trim();
 const SUPABASE_URL = rawUrl.startsWith('http')
   ? rawUrl
@@ -28,7 +26,7 @@ const SUPABASE_URL = rawUrl.startsWith('http')
 const SUPABASE_SERVICE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 
 if (!SUPABASE_SERVICE_KEY) {
-  console.error('CRITICAL: SUPABASE_SERVICE_ROLE_KEY is missing in environment variables.');
+  console.error('CRITICAL: SUPABASE_SERVICE_ROLE_KEY is missing.');
   process.exit(1);
 }
 
@@ -40,7 +38,6 @@ if (!fs.existsSync(AUTH_BASE_DIR)) {
   fs.mkdirSync(AUTH_BASE_DIR, { recursive: true });
 }
 
-// Track active sessions by user_id
 const activeSessions = new Map();
 
 function sanitizePhone(phone) {
@@ -65,15 +62,22 @@ async function startSession(sessionRow, forceFreshPair = false) {
   const userId = sessionRow.user_id;
   const cleanPhone = sanitizePhone(sessionRow.phone_number);
 
-  if (!cleanPhone || cleanPhone.length < 9) {
-    console.warn(`[${userId}] Invalid phone number: ${sessionRow.phone_number}`);
-    return;
+  if (!cleanPhone || cleanPhone.length < 9) return;
+
+  // Prevent duplicate sockets for the exact same phone number across different user_ids
+  for (const [otherUid, otherEntry] of activeSessions.entries()) {
+    if (otherUid !== userId && otherEntry.phone === cleanPhone) {
+      console.warn(`[${userId}] Skipping ${cleanPhone}: already active under user ${otherUid}`);
+      await updateSessionRow(userId, {
+        status: 'duplicate_number',
+        pairing_code: null,
+      });
+      return;
+    }
   }
 
   const prev = activeSessions.get(userId);
-  if (prev?.reconnectTimer) {
-    clearTimeout(prev.reconnectTimer);
-  }
+  if (prev?.reconnectTimer) clearTimeout(prev.reconnectTimer);
   if (prev?.sock) {
     try {
       prev.sock.ev.removeAllListeners('connection.update');
@@ -120,7 +124,6 @@ async function startSession(sessionRow, forceFreshPair = false) {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // Request pairing code once socket emits qr and account is not yet registered
     if (qr && !sock.authState.creds.registered && !pairingCodeRequested) {
       pairingCodeRequested = true;
       try {
@@ -131,7 +134,7 @@ async function startSession(sessionRow, forceFreshPair = false) {
             : rawCode;
 
         console.log(`[${userId}] Generated real WhatsApp pairing code ${formattedCode} for ${cleanPhone}`);
-        sessionEntry.status = 'pending';
+        sessionEntry.status = 'awaiting_code';
 
         await updateSessionRow(userId, {
           pairing_code: formattedCode,
@@ -156,7 +159,7 @@ async function startSession(sessionRow, forceFreshPair = false) {
 
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+      const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
 
       console.log(`[${userId}] Connection closed (code: ${statusCode || 'unknown'})`);
 
@@ -167,6 +170,7 @@ async function startSession(sessionRow, forceFreshPair = false) {
         sessionEntry.status = 'disconnected';
         activeSessions.delete(userId);
 
+        // Set status to 'disconnected' so pollSessions does NOT endlessly spam new pairing codes
         await updateSessionRow(userId, {
           status: 'disconnected',
           pairing_code: null,
@@ -176,12 +180,7 @@ async function startSession(sessionRow, forceFreshPair = false) {
 
       const wasConnected =
         sessionEntry.status === 'connected' || Boolean(sock.authState.creds.registered);
-      sessionEntry.status = wasConnected ? 'connected' : 'pending';
-
-      await updateSessionRow(userId, {
-        status: wasConnected ? 'connected' : 'pending',
-        ...(wasConnected ? { pairing_code: null } : {}),
-      });
+      sessionEntry.status = wasConnected ? 'connected' : 'awaiting_code';
 
       const delayMs = statusCode === DisconnectReason.restartRequired ? 500 : 3000;
       sessionEntry.reconnectTimer = setTimeout(() => {
@@ -190,7 +189,6 @@ async function startSession(sessionRow, forceFreshPair = false) {
     }
   });
 
-  // Handle incoming messages and auto-reply via yumilo-assistant
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
@@ -268,12 +266,12 @@ async function startSession(sessionRow, forceFreshPair = false) {
   });
 }
 
-// 3. Poll whatsapp_sessions every 5 seconds and start/re-pair as needed
 async function pollSessions() {
   try {
     const { data: rows, error } = await supabase
       .from('whatsapp_sessions')
-      .select('*');
+      .select('*')
+      .order('updated_at', { ascending: false });
 
     if (error) {
       console.error('Error reading whatsapp_sessions:', error.message);
@@ -282,7 +280,6 @@ async function pollSessions() {
 
     const activeUserIds = new Set((rows || []).map((r) => r.user_id));
 
-    // Clean up sessions removed from whatsapp_sessions
     for (const [uid, entry] of activeSessions.entries()) {
       if (!activeUserIds.has(uid)) {
         if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
@@ -295,14 +292,17 @@ async function pollSessions() {
       const cleanPhone = sanitizePhone(row.phone_number);
       if (!cleanPhone) continue;
 
+      const status = (row.status || '').toLowerCase();
+      // Do not auto-start disconnected or duplicate rows until the user clicks Request Real Link Code on the website
+      if (status === 'disconnected' || status === 'duplicate_number') continue;
+
       const existing = activeSessions.get(row.user_id);
-      const wantsFreshCode =
-        (row.status || '').toLowerCase() === 'pending' && !row.pairing_code;
+      const wantsFreshCode = status === 'pending' && !row.pairing_code;
 
       if (!existing || existing.phone !== cleanPhone) {
         console.log(`[${row.user_id}] Starting WhatsApp session for ${cleanPhone}...`);
         await startSession(row, wantsFreshCode);
-      } else if (wantsFreshCode && existing.status !== 'connected') {
+      } else if (wantsFreshCode && existing.status !== 'connected' && existing.status !== 'awaiting_code') {
         console.log(`[${row.user_id}] Fresh pairing code requested for ${cleanPhone}...`);
         await startSession(row, true);
       }
