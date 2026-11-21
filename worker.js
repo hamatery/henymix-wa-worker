@@ -25,7 +25,6 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const logger = pino({ level: "silent" });
 
-// Active Baileys sockets keyed by user_id
 const activeSockets = new Map();
 const startingUsers = new Set();
 
@@ -70,10 +69,8 @@ function shouldReplyToMessage({ msg, sock, sessionRow, text }) {
   if (isGroup && sessionRow.reply_in_groups === false) return false;
   if (!isGroup && sessionRow.reply_in_dms === false) return false;
 
-  // Direct messages reply automatically when reply_in_dms is enabled
   if (!isGroup) return true;
 
-  // Group messages: check native WhatsApp @mention (JID or LID) OR trigger keywords
   const botDigits = normalizeDigits(sock.user?.id || sessionRow.phone_number);
   const botLidDigits = normalizeDigits(sock.user?.lid || "");
   const mentionedJids = extractMentionedJids(msg);
@@ -155,7 +152,6 @@ async function startSessionForUser(sessionRow) {
       await backupAuthFolderToSupabase(userId, authDir);
     });
 
-    // Request real 8-character pairing code if not yet registered
     if (!sock.authState.creds.registered && sessionRow.phone_number) {
       setTimeout(async () => {
         try {
@@ -208,7 +204,6 @@ async function startSessionForUser(sessionRow) {
             })
             .eq("user_id", userId);
         } else {
-          // Reconnect automatically on transient disconnect
           setTimeout(() => syncSessionsFromSupabase(), 4000);
         }
       }
@@ -222,7 +217,6 @@ async function startSessionForUser(sessionRow) {
           const rawText = extractMessageText(msg);
           if (!rawText) continue;
 
-          // Fetch latest trigger settings from DB
           const { data: latestSession } = await supabase
             .from("whatsapp_sessions")
             .select("*")
@@ -237,8 +231,6 @@ async function startSessionForUser(sessionRow) {
           const remoteJid = msg.key.remoteJid;
           const participantJid = msg.key.participant || remoteJid;
           const senderPhone = normalizeDigits(participantJid);
-
-          // Strip @number mention tokens from text so the AI gets a clean prompt
           const cleanPrompt = rawText.replace(/@\d{6,16}/g, "").trim() || "Hello";
 
           await sock.sendPresenceUpdate("composing", remoteJid);
@@ -297,7 +289,6 @@ async function syncSessionsFromSupabase() {
 
     const validUserIds = new Set(sessions.map((s) => s.user_id));
 
-    // Close sockets for unlinked users
     for (const [uid, sock] of activeSockets.entries()) {
       if (!validUserIds.has(uid)) {
         try { sock.end(); } catch {}
@@ -305,7 +296,6 @@ async function syncSessionsFromSupabase() {
       }
     }
 
-    // Start sockets for pending or connected users
     for (const row of sessions) {
       if (row.phone_number && row.status !== "logged_out") {
         await startSessionForUser(row);
