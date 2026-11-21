@@ -280,7 +280,13 @@ async function startSession(sessionRow, forceFreshPair = false) {
         sessionEntry.status === 'connected' || Boolean(sock.authState.creds.registered);
       sessionEntry.status = wasConnected ? 'connected' : 'awaiting_code';
 
-      const delayMs = statusCode === DisconnectReason.restartRequired ? 300 : 3000;
+      let delayMs = 3000;
+      if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+        delayMs = 300;
+      } else if (statusCode === 440) {
+        delayMs = 25000;
+      }
+
       sessionEntry.reconnectTimer = setTimeout(() => {
         startSession({ ...sessionRow, phone_number: cleanPhone }, false);
       }, delayMs);
@@ -380,7 +386,7 @@ async function startSession(sessionRow, forceFreshPair = false) {
         );
 
         if (fnError) {
-          console.error(`[${userId}] yumilo-assistant error:`, fnError);
+          console.error(`[${userId}] yumilo-assistant error for "${cleanedPrompt}":`, fnError);
           continue;
         }
 
@@ -388,7 +394,7 @@ async function startSession(sessionRow, forceFreshPair = false) {
           fnData?.reply || fnData?.response || fnData?.message || fnData?.text;
 
         if (!replyText || !String(replyText).trim()) {
-          console.warn(`[${userId}] Empty reply from yumilo-assistant:`, fnData);
+          console.warn(`[${userId}] Empty reply for "${cleanedPrompt}":`, fnData);
           continue;
         }
 
@@ -397,9 +403,9 @@ async function startSession(sessionRow, forceFreshPair = false) {
           { text: formatForWhatsApp(replyText) },
           { quoted: msg }
         );
-        console.log(`[${userId}] Replied successfully to ${remoteJid}`);
+        console.log(`[${userId}] Replied successfully to "${cleanedPrompt}"`);
       } catch (err) {
-        console.error(`[${userId}] Auto-reply failed:`, err);
+        console.error(`[${userId}] Auto-reply failed for "${cleanedPrompt}":`, err);
       } finally {
         await sock.sendPresenceUpdate('paused', remoteJid);
       }
