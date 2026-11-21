@@ -1,3 +1,4 @@
+import http from 'node:http';
 import {
   makeWASocket,
   useMultiFileAuthState,
@@ -39,6 +40,7 @@ const SUPABASE_FUNCTION_URL = /^https?:\/\/.+/i.test(rawFnUrl)
   ? rawFnUrl
   : `${SUPABASE_URL}/functions/v1/yumilo-assistant`;
 
+const PORT = Number(cleanEnv(process.env.PORT) || 10000);
 const POLL_INTERVAL_MS = Number(cleanEnv(process.env.POLL_INTERVAL_MS) || 4000);
 const AUTH_BASE_DIR = cleanEnv(process.env.AUTH_BASE_DIR) || './auth_sessions';
 
@@ -56,6 +58,23 @@ const activeSockets = new Map();
 const chatHistories = new Map();
 // Track recently processed message IDs to prevent duplicate replies
 const processedMsgIds = new Set();
+
+function startHealthServer() {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        status: 'ok',
+        service: 'henymix-wa-worker',
+        activeSockets: activeSockets.size,
+      })
+    );
+  });
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Health server listening on port ${PORT}`);
+  });
+}
 
 function sanitizePhone(val) {
   return String(val || '').replace(/\D/g, '');
@@ -174,7 +193,6 @@ async function handleIncomingWhatsAppMessage(userId, sessionConfig, sock, msg) {
       recordHistory(remoteJid, 'model', replyText);
     }
 
-    // Send actual product photos with captions on WhatsApp
     for (const img of images) {
       if (img?.url) {
         await sock.sendMessage(remoteJid, {
@@ -235,7 +253,6 @@ async function startUserSocket(sessionRow) {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // Request real WhatsApp pairing code if not yet registered/paired
   if (!state.creds.registered) {
     const currentStatus = String(sessionRow.status || '').toLowerCase();
     const hasExistingCode = Boolean(
@@ -352,6 +369,7 @@ async function syncSessions() {
 }
 
 async function main() {
+  startHealthServer();
   console.log('Henymix WhatsApp Worker started.');
   await syncSessions();
   setInterval(() => {
