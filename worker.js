@@ -20,6 +20,12 @@ process.on("uncaughtException", (err) => {
 
 const app = express();
 app.use(express.json());
+app.use((_req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  next();
+});
 
 const DEFAULT_SUPABASE_URL = "https://syxibiyrbgwsgghwwgej.supabase.co";
 const PORT = Number(process.env.PORT) || 10000;
@@ -84,9 +90,20 @@ function normalizeDigits(jidOrPhone) {
     .replace(/\D/g, "");
 }
 
+function cleanOutboundText(text) {
+  return String(text || "")
+    .replace(/\*\*\*/g, "")
+    .replace(/\*\*/g, "*")
+    .replace(/```[\s\S]*?```/g, "")
+    .trim();
+}
+
 function extractMessageText(msg) {
   const m = msg?.message;
   if (!m) return "";
+  if (m.audioMessage) {
+    return "[Voice Note received]";
+  }
   return (
     m.conversation ||
     m.extendedTextMessage?.text ||
@@ -98,56 +115,33 @@ function extractMessageText(msg) {
   ).trim();
 }
 
-function extractMentionedJids(msg) {
-  const m = msg?.message;
-  if (!m) return [];
-  return (
-    m.extendedTextMessage?.contextInfo?.mentionedJid ||
-    m.imageMessage?.contextInfo?.mentionedJid ||
-    m.videoMessage?.contextInfo?.mentionedJid ||
-    []
-  );
-}
-
-function shouldReplyToMessage({ msg, sock, sessionRow, text }) {
+function shouldReplyToMessage({ msg, sessionRow, text }) {
   const remoteJid = msg.key?.remoteJid || "";
-  if (!remoteJid || remoteJid === "status@broadcast") return { ok: false, reason: "status_or_empty" };
-  if (msg.key?.fromMe) return { ok: false, reason: "fromMe_true" };
+  if (!remoteJid || remoteJid === "status@broadcast") return false;
+  if (msg.key?.fromMe) return false;
+  if (!text) return false;
 
   const isGroup = remoteJid.endsWith("@g.us");
-  if (isGroup && sessionRow.reply_in_groups === false) {
-    return { ok: false, reason: "reply_in_groups_false" };
+  if (isGroup && sessionRow.reply_in_groups === false) return false;
+  if (!isGroup && sessionRow.reply_in_dms === false) return false;
+
+  // Respond automatically without requiring a tag or keyword
+  return true;
+}
+
+async function logWhatsAppMessage({ userId, chatJid, senderPhone, senderName, direction, body }) {
+  try {
+    await supabase.from("whatsapp_messages").insert({
+      user_id: userId,
+      chat_jid: chatJid,
+      sender_phone: senderPhone || "",
+      sender_name: senderName || "",
+      direction,
+      body: String(body || "").slice(0, 4000)
+    });
+  } catch (err) {
+    console.error("Failed to log whatsapp_messages:", err.message);
   }
-  if (!isGroup && sessionRow.reply_in_dms === false) {
-    return { ok: false, reason: "reply_in_dms_false" };
-  }
-
-  if (!isGroup) return { ok: true, reason: "dm_allowed" };
-
-  const botDigits = normalizeDigits(sock.user?.id || sessionRow.phone_number);
-  const botLidDigits = normalizeDigits(sock.user?.lid || "");
-  const mentionedJids = extractMentionedJids(msg);
-
-  const isTaggedDirectly = mentionedJids.some((jid) => {
-    const d = normalizeDigits(jid);
-    return (botDigits && d === botDigits) || (botLidDigits && d === botLidDigits);
-  });
-
-  if (isTaggedDirectly) return { ok: true, reason: "mentioned_jid_match" };
-
-  const keywords = String(sessionRow.trigger_keywords || "@henymix, henymix")
-    .split(",")
-    .map((k) => k.trim().toLowerCase())
-    .filter(Boolean);
-
-  const lowerText = text.toLowerCase();
-  const matchedKw = keywords.find((kw) => lowerText.includes(kw));
-  if (matchedKw) return { ok: true, reason: `keyword:${matchedKw}` };
-
-  return {
-    ok: false,
-    reason: `no_match (mentioned=${JSON.stringify(mentionedJids)}, bot=${botDigits}, lid=${botLidDigits})`
-  };
 }
 
 async function restoreAuthFolderFromSupabase(userId, authDir) {
@@ -223,6 +217,20 @@ async function startSessionForUser(sessionRow) {
 
     activeSockets.set(userId, sock);
 
+    // Reject incoming voice/video calls automatically
+    sock.ev.on("call", async (calls) => {
+      for (const call of calls) {
+        if (call.status === "offer") {
+          try {
+            await sock.rejectCall(call.id, call.from);
+            console.log(`[WA CALL DECLINED] from=${call.from}`);
+          } catch (err) {
+            console.error("Call reject error:", err.message);
+          }
+        }
+      }
+    });
+
     sock.ev.on("creds.update", async () => {
       try {
         fs.mkdirSync(authDir, { recursive: true });
@@ -283,12 +291,11 @@ async function startSessionForUser(sessionRow) {
               updated_at: new Date().toISOString()
             })
             .eq("user_id", userId);
-          console.log(`WhatsApp connected for user ${userId} (jid=${sock.user?.id || ""}, lid=${sock.user?.lid || ""})`);
+          console.log(`WhatsApp connected for user ${userId}`);
         } else if (connection === "close") {
           activeSockets.delete(userId);
           const statusCode = lastDisconnect?.error?.output?.statusCode;
           const loggedOut = statusCode === DisconnectReason.loggedOut;
-          console.log(`WhatsApp connection closed for user ${userId} (statusCode=${statusCode || "unknown"}, loggedOut=${loggedOut})`);
 
           if (loggedOut) {
             pairingAttempted.delete(userId);
@@ -319,6 +326,22 @@ async function startSessionForUser(sessionRow) {
           const rawText = extractMessageText(msg);
           if (!rawText) continue;
 
+          const remoteJid = msg.key?.remoteJid || "";
+          const participantJid = msg.key?.participant || remoteJid;
+          const senderPhone = normalizeDigits(participantJid);
+          const senderName = String(msg.pushName || "").trim();
+
+          if (!msg.key?.fromMe && remoteJid && remoteJid !== "status@broadcast") {
+            await logWhatsAppMessage({
+              userId,
+              chatJid: remoteJid,
+              senderPhone,
+              senderName,
+              direction: "inbound",
+              body: rawText
+            });
+          }
+
           const { data: latestSession } = await supabase
             .from("whatsapp_sessions")
             .select("*")
@@ -326,17 +349,9 @@ async function startSessionForUser(sessionRow) {
             .maybeSingle();
 
           const activeCfg = latestSession || sessionRow;
-          const decision = shouldReplyToMessage({ msg, sock, sessionRow: activeCfg, text: rawText });
-          console.log(`[WA MSG] chat=${msg.key?.remoteJid} fromMe=${msg.key?.fromMe} text="${rawText}" -> ${decision.reason}`);
-
-          if (!decision.ok) {
+          if (!shouldReplyToMessage({ msg, sessionRow: activeCfg, text: rawText })) {
             continue;
           }
-
-          const remoteJid = msg.key.remoteJid;
-          const participantJid = msg.key.participant || remoteJid;
-          const senderPhone = normalizeDigits(participantJid);
-          const cleanPrompt = rawText.replace(/@\d{6,16}/g, "").trim() || "Hello";
 
           await sock.sendPresenceUpdate("composing", remoteJid);
 
@@ -351,21 +366,14 @@ async function startSessionForUser(sessionRow) {
               user_id: userId,
               platform: "whatsapp",
               sender_phone: senderPhone,
-              message: cleanPrompt
+              sender_name: senderName,
+              message: rawText
             })
           });
 
-          const rawBody = await fnRes.text();
-          let data = {};
-          try {
-            data = JSON.parse(rawBody);
-          } catch {
-            console.error(`[FN NON-JSON] status=${fnRes.status} body=${rawBody.slice(0, 300)}`);
-          }
-
-          console.log(`[FN RESULT] status=${fnRes.status} hasReply=${Boolean(data?.reply)}`);
-
-          const replyText = data?.reply;
+          const data = await fnRes.json().catch(() => ({}));
+          const replyText = cleanOutboundText(data?.reply || "");
+          const audioUrl = typeof data?.audio_url === "string" ? data.audio_url : "";
           const imageUrls = Array.isArray(data?.images)
             ? data.images
             : data?.image_url
@@ -374,7 +382,22 @@ async function startSessionForUser(sessionRow) {
 
           if (replyText) {
             await sock.sendMessage(remoteJid, { text: replyText }, { quoted: msg });
-            console.log(`[WA SENT] to=${remoteJid}`);
+            await logWhatsAppMessage({
+              userId,
+              chatJid: remoteJid,
+              senderPhone,
+              senderName,
+              direction: "outbound",
+              body: replyText
+            });
+          }
+
+          if (audioUrl && audioUrl.startsWith("http")) {
+            await sock.sendMessage(remoteJid, {
+              audio: { url: audioUrl },
+              mimetype: "audio/mp4",
+              ptt: true
+            });
           }
 
           for (const imgUrl of imageUrls) {
@@ -422,6 +445,39 @@ async function syncSessionsFromSupabase() {
     console.error("Session sync error:", err.message);
   }
 }
+
+app.post("/api/send-whatsapp", async (req, res) => {
+  try {
+    const { user_id, to, message } = req.body || {};
+    if (!to || !message) {
+      return res.status(400).json({ error: "Missing 'to' or 'message'" });
+    }
+
+    const targetUserId = user_id || [...activeSockets.keys()][0];
+    const sock = activeSockets.get(targetUserId);
+    if (!sock) {
+      return res.status(409).json({ error: "WhatsApp worker not connected" });
+    }
+
+    const cleanedMessage = cleanOutboundText(message);
+    const digits = normalizeDigits(to);
+    const jid = String(to).includes("@") ? String(to) : `${digits}@s.whatsapp.net`;
+
+    await sock.sendMessage(jid, { text: cleanedMessage });
+    await logWhatsAppMessage({
+      userId: targetUserId,
+      chatJid: jid,
+      senderPhone: digits,
+      senderName: "",
+      direction: "outbound",
+      body: cleanedMessage
+    });
+
+    return res.json({ ok: true, to: jid });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 app.get("/", (_req, res) => {
   res.json({
