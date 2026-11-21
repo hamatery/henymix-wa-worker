@@ -33,6 +33,8 @@ if (!SUPABASE_SERVICE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const logger = pino({ level: 'silent' });
 const activeSessions = new Map();
+const processedMsgIds = new Set();
+const chatHistoryCache = new Map();
 
 function sanitizePhone(phone) {
   return String(phone || '').replace(/\D/g, '');
@@ -47,6 +49,20 @@ function formatForWhatsApp(text) {
     // Convert Markdown "* " or "- " bullets to clean "• " bullets
     .replace(/^\s*[\*\-]\s+/gm, '• ')
     .trim();
+}
+
+function getRecentChatHistory(chatKey) {
+  return chatHistoryCache.get(chatKey) || [];
+}
+
+function appendChatHistory(chatKey, role, content) {
+  const history = chatHistoryCache.get(chatKey) || [];
+  history.push({ role, content });
+  // Keep the last 10 turns per WhatsApp chat for follow-up questions
+  if (history.length > 10) {
+    history.splice(0, history.length - 10);
+  }
+  chatHistoryCache.set(chatKey, history);
 }
 
 async function updateSessionRow(userId, fields) {
@@ -295,6 +311,16 @@ async function startSession(sessionRow, forceFreshPair = false) {
     for (const msg of messages) {
       if (!msg.message) continue;
 
+      const msgId = msg.key?.id;
+      if (msgId) {
+        if (processedMsgIds.has(msgId)) continue;
+        processedMsgIds.add(msgId);
+        if (processedMsgIds.size > 500) {
+          const oldestId = processedMsgIds.values().next().value;
+          processedMsgIds.delete(oldestId);
+        }
+      }
+
       const remoteJid = msg.key.remoteJid || '';
       if (!remoteJid || remoteJid === 'status@broadcast') continue;
 
@@ -346,6 +372,9 @@ async function startSession(sessionRow, forceFreshPair = false) {
       const cleanedPrompt =
         text.replace(new RegExp(`@${myNumber}\\b`, 'g'), '').trim() || text;
 
+      const chatKey = `${userId}:${remoteJid}`;
+      const history = getRecentChatHistory(chatKey);
+
       try {
         await sock.sendPresenceUpdate('composing', remoteJid);
 
@@ -356,6 +385,7 @@ async function startSession(sessionRow, forceFreshPair = false) {
           {
             body: {
               message: cleanedPrompt,
+              history,
               user_id: userId,
               sender: senderJid,
               is_group: isGroup,
@@ -365,20 +395,28 @@ async function startSession(sessionRow, forceFreshPair = false) {
         );
 
         if (fnError) {
-          console.error(`[${userId}] yumilo-assistant error:`, fnError);
+          console.error(`[${userId}] yumilo-assistant error for "${cleanedPrompt}":`, fnError);
           continue;
         }
 
         const replyText =
           fnData?.reply || fnData?.response || fnData?.message || fnData?.text;
 
-        if (replyText) {
-          await sock.sendMessage(
-            remoteJid,
-            { text: formatForWhatsApp(replyText) },
-            { quoted: msg }
-          );
+        if (!replyText || !String(replyText).trim()) {
+          console.warn(`[${userId}] Empty reply from yumilo-assistant for "${cleanedPrompt}"`);
+          continue;
         }
+
+        const formattedReply = formatForWhatsApp(replyText);
+
+        appendChatHistory(chatKey, 'user', cleanedPrompt);
+        appendChatHistory(chatKey, 'assistant', formattedReply);
+
+        await sock.sendMessage(
+          remoteJid,
+          { text: formattedReply },
+          { quoted: msg }
+        );
       } catch (err) {
         console.error(`[${userId}] Auto-reply failed:`, err);
       } finally {
