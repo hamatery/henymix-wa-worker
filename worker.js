@@ -9,23 +9,36 @@ import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
 
-const SUPABASE_URL = process.env.SUPABASE_URL || '';
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-const SUPABASE_FUNCTION_URL =
-  process.env.SUPABASE_FUNCTION_URL ||
-  (SUPABASE_URL ? `${SUPABASE_URL}/functions/v1/yumilo-assistant` : '');
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 4000);
-const AUTH_BASE_DIR = process.env.AUTH_BASE_DIR || './auth_sessions';
+const cleanEnv = (val) => String(val || '').trim().replace(/^["']|["']$/g, '');
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !SUPABASE_FUNCTION_URL) {
-  console.error('Missing SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, or SUPABASE_FUNCTION_URL.');
+const SUPABASE_URL =
+  cleanEnv(process.env.SUPABASE_URL) ||
+  cleanEnv(process.env.VITE_SUPABASE_URL) ||
+  cleanEnv(process.env.NEXT_PUBLIC_SUPABASE_URL) ||
+  'https://syxibiyrbgwsgghwwgej.supabase.co';
+
+const SUPABASE_KEY =
+  cleanEnv(process.env.SUPABASE_SERVICE_ROLE_KEY) ||
+  cleanEnv(process.env.SUPABASE_KEY) ||
+  cleanEnv(process.env.SUPABASE_SERVICE_KEY) ||
+  cleanEnv(process.env.SUPABASE_ANON_KEY);
+
+const SUPABASE_FUNCTION_URL =
+  cleanEnv(process.env.SUPABASE_FUNCTION_URL) ||
+  `${SUPABASE_URL}/functions/v1/yumilo-assistant`;
+
+const POLL_INTERVAL_MS = Number(cleanEnv(process.env.POLL_INTERVAL_MS) || 4000);
+const AUTH_BASE_DIR = cleanEnv(process.env.AUTH_BASE_DIR) || './auth_sessions';
+
+if (!SUPABASE_KEY) {
+  console.error('Missing Supabase key in environment variables.');
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const logger = pino({ level: 'silent' });
 
-// Map<userId, { sock, phoneNumber, pairingRequestedFor, pairingRequestedAt, isConnecting }>
+// Map<userId, { sock, phoneNumber, sessionConfig, isConnecting, pairingRequested }>
 const activeSockets = new Map();
 // Map<chatJid, Array<{ role: 'user' | 'model', text: string }>>
 const chatHistories = new Map();
@@ -121,7 +134,7 @@ async function handleIncomingWhatsAppMessage(userId, sessionConfig, sock, msg) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
       },
       body: JSON.stringify({
         user_id: userId,
