@@ -1,380 +1,339 @@
-import http from 'node:http';
-import {
-  makeWASocket,
-  useMultiFileAuthState,
+import express from "express";
+import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
-} from '@whiskeysockets/baileys';
-import { createClient } from '@supabase/supabase-js';
-import pino from 'pino';
-import fs from 'fs';
-import path from 'path';
+  useMultiFileAuthState
+} from "@whiskeysockets/baileys";
+import { createClient } from "@supabase/supabase-js";
+import pino from "pino";
+import fs from "fs";
+import path from "path";
 
-const DEFAULT_SUPABASE_URL = 'https://syxibiyrbgwsgghwwgej.supabase.co';
-const cleanEnv = (val) => String(val || '').trim().replace(/^["']|["']$/g, '');
+const app = express();
+app.use(express.json());
 
-function pickValidUrl(...candidates) {
-  for (const raw of candidates) {
-    const cleaned = cleanEnv(raw);
-    if (/^https?:\/\/.+/i.test(cleaned)) {
-      return cleaned.replace(/\/+$/, '');
-    }
-  }
-  return DEFAULT_SUPABASE_URL;
-}
+const PORT = process.env.PORT || 10000;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const FUNCTION_URL = `${SUPABASE_URL}/functions/v1/yumilo-assistant`;
 
-const SUPABASE_URL = pickValidUrl(
-  process.env.SUPABASE_URL,
-  process.env.VITE_SUPABASE_URL,
-  process.env.NEXT_PUBLIC_SUPABASE_URL
-);
-
-const SUPABASE_KEY =
-  cleanEnv(process.env.SUPABASE_SERVICE_ROLE_KEY) ||
-  cleanEnv(process.env.SUPABASE_KEY) ||
-  cleanEnv(process.env.SUPABASE_SERVICE_KEY) ||
-  cleanEnv(process.env.SUPABASE_ANON_KEY);
-
-const rawFnUrl = cleanEnv(process.env.SUPABASE_FUNCTION_URL);
-const SUPABASE_FUNCTION_URL = /^https?:\/\/.+/i.test(rawFnUrl)
-  ? rawFnUrl
-  : `${SUPABASE_URL}/functions/v1/yumilo-assistant`;
-
-const PORT = Number(cleanEnv(process.env.PORT) || 10000);
-const POLL_INTERVAL_MS = Number(cleanEnv(process.env.POLL_INTERVAL_MS) || 4000);
-const AUTH_BASE_DIR = cleanEnv(process.env.AUTH_BASE_DIR) || './auth_sessions';
-
-if (!SUPABASE_KEY) {
-  console.error('Missing Supabase key in environment variables.');
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables.");
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-const logger = pino({ level: 'silent' });
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const logger = pino({ level: "silent" });
 
-// Map<userId, { sock, phoneNumber, sessionConfig, isConnecting, pairingRequested }>
+// Active Baileys sockets keyed by user_id
 const activeSockets = new Map();
-// Map<chatJid, Array<{ role: 'user' | 'model', text: string }>>
-const chatHistories = new Map();
-// Track recently processed message IDs to prevent duplicate replies
-const processedMsgIds = new Set();
+const startingUsers = new Set();
 
-function startHealthServer() {
-  const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(
-      JSON.stringify({
-        status: 'ok',
-        service: 'henymix-wa-worker',
-        activeSockets: activeSockets.size,
-      })
-    );
-  });
-
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Health server listening on port ${PORT}`);
-  });
+function normalizeDigits(jidOrPhone) {
+  return String(jidOrPhone || "")
+    .split("@")[0]
+    .split(":")[0]
+    .replace(/\D/g, "");
 }
 
-function sanitizePhone(val) {
-  return String(val || '').replace(/\D/g, '');
-}
-
-function getMessageText(msg) {
+function extractMessageText(msg) {
   const m = msg?.message;
-  if (!m) return '';
+  if (!m) return "";
   return (
     m.conversation ||
     m.extendedTextMessage?.text ||
     m.imageMessage?.caption ||
     m.videoMessage?.caption ||
-    m.documentMessage?.caption ||
-    ''
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.listResponseMessage?.title ||
+    ""
   ).trim();
 }
 
-function isBotMentionedOrCalled(msg, text, sessionConfig, botJid) {
-  const isGroup = Boolean(msg?.key?.remoteJid?.endsWith('@g.us'));
-  if (!isGroup) {
-    return sessionConfig?.reply_in_dms !== false;
-  }
+function extractMentionedJids(msg) {
+  const m = msg?.message;
+  if (!m) return [];
+  return (
+    m.extendedTextMessage?.contextInfo?.mentionedJid ||
+    m.imageMessage?.contextInfo?.mentionedJid ||
+    m.videoMessage?.contextInfo?.mentionedJid ||
+    []
+  );
+}
 
-  if (sessionConfig?.reply_in_groups === false) {
-    return false;
-  }
+function shouldReplyToMessage({ msg, sock, sessionRow, text }) {
+  const remoteJid = msg.key?.remoteJid || "";
+  if (!remoteJid || remoteJid === "status@broadcast") return false;
+  if (msg.key?.fromMe) return false;
 
-  const mentionedJids =
-    msg?.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
-  const botNumber = sanitizePhone(botJid?.split('@')[0]);
+  const isGroup = remoteJid.endsWith("@g.us");
+  if (isGroup && sessionRow.reply_in_groups === false) return false;
+  if (!isGroup && sessionRow.reply_in_dms === false) return false;
 
-  if (
-    botNumber &&
-    mentionedJids.some((jid) => sanitizePhone(jid?.split('@')[0]) === botNumber)
-  ) {
-    return true;
-  }
+  // Direct messages reply automatically when reply_in_dms is enabled
+  if (!isGroup) return true;
 
-  const rawKeywords = String(sessionConfig?.trigger_keywords || '@henymix, henymix');
-  const keywords = rawKeywords
-    .split(',')
+  // Group messages: check native WhatsApp @mention (JID or LID) OR trigger keywords
+  const botDigits = normalizeDigits(sock.user?.id || sessionRow.phone_number);
+  const botLidDigits = normalizeDigits(sock.user?.lid || "");
+  const mentionedJids = extractMentionedJids(msg);
+
+  const isTaggedDirectly = mentionedJids.some((jid) => {
+    const d = normalizeDigits(jid);
+    return (botDigits && d === botDigits) || (botLidDigits && d === botLidDigits);
+  });
+
+  if (isTaggedDirectly) return true;
+
+  const keywords = String(sessionRow.trigger_keywords || "@henymix, henymix")
+    .split(",")
     .map((k) => k.trim().toLowerCase())
     .filter(Boolean);
 
-  const lowerText = String(text || '').toLowerCase();
+  const lowerText = text.toLowerCase();
   return keywords.some((kw) => lowerText.includes(kw));
 }
 
-function recordHistory(chatJid, role, text) {
-  if (!text) return;
-  const arr = chatHistories.get(chatJid) || [];
-  arr.push({ role, text });
-  if (arr.length > 10) arr.splice(0, arr.length - 10);
-  chatHistories.set(chatJid, arr);
+async function restoreAuthFolderFromSupabase(userId, authDir) {
+  fs.mkdirSync(authDir, { recursive: true });
+  const { data } = await supabase
+    .from("whatsapp_sessions")
+    .select("auth_creds")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (data?.auth_creds && typeof data.auth_creds === "object") {
+    for (const [fileName, content] of Object.entries(data.auth_creds)) {
+      fs.writeFileSync(path.join(authDir, fileName), JSON.stringify(content));
+    }
+  }
 }
 
-async function handleIncomingWhatsAppMessage(userId, sessionConfig, sock, msg) {
+async function backupAuthFolderToSupabase(userId, authDir) {
   try {
-    if (!msg?.message) return;
-    if (msg.key?.fromMe) return;
+    if (!fs.existsSync(authDir)) return;
+    const files = fs.readdirSync(authDir);
+    const bundle = {};
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue;
+      const raw = fs.readFileSync(path.join(authDir, f), "utf8");
+      bundle[f] = JSON.parse(raw);
+    }
+    await supabase
+      .from("whatsapp_sessions")
+      .update({ auth_creds: bundle, updated_at: new Date().toISOString() })
+      .eq("user_id", userId);
+  } catch (err) {
+    console.error("Auth backup error:", err.message);
+  }
+}
 
-    const msgId = msg.key?.id;
-    if (msgId) {
-      if (processedMsgIds.has(msgId)) return;
-      processedMsgIds.add(msgId);
-      if (processedMsgIds.size > 2000) {
-        const first = processedMsgIds.values().next().value;
-        processedMsgIds.delete(first);
+async function startSessionForUser(sessionRow) {
+  const userId = sessionRow.user_id;
+  if (!userId || activeSockets.has(userId) || startingUsers.has(userId)) return;
+
+  startingUsers.add(userId);
+  const authDir = path.join("/tmp", `wa_auth_${userId}`);
+
+  try {
+    await restoreAuthFolderFromSupabase(userId, authDir);
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    const { version } = await fetchLatestBaileysVersion();
+
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      logger,
+      printQRInTerminal: false,
+      browser: ["Henymix", "Chrome", "124.0.0"]
+    });
+
+    activeSockets.set(userId, sock);
+
+    sock.ev.on("creds.update", async () => {
+      await saveCreds();
+      await backupAuthFolderToSupabase(userId, authDir);
+    });
+
+    // Request real 8-character pairing code if not yet registered
+    if (!sock.authState.creds.registered && sessionRow.phone_number) {
+      setTimeout(async () => {
+        try {
+          const cleanPhone = normalizeDigits(sessionRow.phone_number);
+          const code = await sock.requestPairingCode(cleanPhone);
+          const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code;
+          await supabase
+            .from("whatsapp_sessions")
+            .update({
+              pairing_code: formattedCode,
+              status: "code_ready",
+              updated_at: new Date().toISOString()
+            })
+            .eq("user_id", userId);
+          console.log(`Pairing code issued for ${cleanPhone}: ${formattedCode}`);
+        } catch (err) {
+          console.error("Failed to request pairing code:", err.message);
+        }
+      }, 3000);
+    }
+
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect } = update;
+
+      if (connection === "open") {
+        await backupAuthFolderToSupabase(userId, authDir);
+        await supabase
+          .from("whatsapp_sessions")
+          .update({
+            status: "connected",
+            pairing_code: null,
+            updated_at: new Date().toISOString()
+          })
+          .eq("user_id", userId);
+        console.log(`WhatsApp connected for user ${userId}`);
+      } else if (connection === "close") {
+        activeSockets.delete(userId);
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const loggedOut = statusCode === DisconnectReason.loggedOut;
+
+        if (loggedOut) {
+          fs.rmSync(authDir, { recursive: true, force: true });
+          await supabase
+            .from("whatsapp_sessions")
+            .update({
+              status: "logged_out",
+              pairing_code: null,
+              auth_creds: null,
+              updated_at: new Date().toISOString()
+            })
+            .eq("user_id", userId);
+        } else {
+          // Reconnect automatically on transient disconnect
+          setTimeout(() => syncSessionsFromSupabase(), 4000);
+        }
+      }
+    });
+
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (type !== "notify") return;
+
+      for (const msg of messages) {
+        try {
+          const rawText = extractMessageText(msg);
+          if (!rawText) continue;
+
+          // Fetch latest trigger settings from DB
+          const { data: latestSession } = await supabase
+            .from("whatsapp_sessions")
+            .select("*")
+            .eq("user_id", userId)
+            .maybeSingle();
+
+          const activeCfg = latestSession || sessionRow;
+          if (!shouldReplyToMessage({ msg, sock, sessionRow: activeCfg, text: rawText })) {
+            continue;
+          }
+
+          const remoteJid = msg.key.remoteJid;
+          const participantJid = msg.key.participant || remoteJid;
+          const senderPhone = normalizeDigits(participantJid);
+
+          // Strip @number mention tokens from text so the AI gets a clean prompt
+          const cleanPrompt = rawText.replace(/@\d{6,16}/g, "").trim() || "Hello";
+
+          await sock.sendPresenceUpdate("composing", remoteJid);
+
+          const fnRes = await fetch(FUNCTION_URL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+            },
+            body: JSON.stringify({
+              sessionId: `wa_${remoteJid}`,
+              user_id: userId,
+              platform: "whatsapp",
+              sender_phone: senderPhone,
+              message: cleanPrompt
+            })
+          });
+
+          const data = await fnRes.json();
+          const replyText = data?.reply;
+          const imageUrls = Array.isArray(data?.images)
+            ? data.images
+            : data?.image_url
+              ? [data.image_url]
+              : [];
+
+          if (replyText) {
+            await sock.sendMessage(remoteJid, { text: replyText }, { quoted: msg });
+          }
+
+          for (const imgUrl of imageUrls) {
+            if (typeof imgUrl === "string" && imgUrl.startsWith("http")) {
+              await sock.sendMessage(remoteJid, { image: { url: imgUrl } });
+            }
+          }
+
+          await sock.sendPresenceUpdate("paused", remoteJid);
+        } catch (err) {
+          console.error("Message handling error:", err.message);
+        }
+      }
+    });
+  } finally {
+    startingUsers.delete(userId);
+  }
+}
+
+async function syncSessionsFromSupabase() {
+  try {
+    const { data: sessions, error } = await supabase
+      .from("whatsapp_sessions")
+      .select("*");
+
+    if (error || !Array.isArray(sessions)) return;
+
+    const validUserIds = new Set(sessions.map((s) => s.user_id));
+
+    // Close sockets for unlinked users
+    for (const [uid, sock] of activeSockets.entries()) {
+      if (!validUserIds.has(uid)) {
+        try { sock.end(); } catch {}
+        activeSockets.delete(uid);
       }
     }
 
-    const remoteJid = msg.key?.remoteJid;
-    if (!remoteJid || remoteJid === 'status@broadcast') return;
-
-    const isGroup = remoteJid.endsWith('@g.us');
-    const text = getMessageText(msg);
-    if (!text) return;
-
-    if (!isBotMentionedOrCalled(msg, text, sessionConfig, sock.user?.id)) {
-      return;
-    }
-
-    const senderJid = isGroup ? msg.key?.participant || remoteJid : remoteJid;
-    const history = chatHistories.get(remoteJid) || [];
-
-    const aiResponse = await fetch(SUPABASE_FUNCTION_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-      },
-      body: JSON.stringify({
-        user_id: userId,
-        sender: senderJid,
-        is_group: isGroup,
-        platform: 'whatsapp',
-        message: text,
-        history,
-      }),
-    });
-
-    if (!aiResponse.ok) {
-      const errBody = await aiResponse.text();
-      console.error(`yumilo-assistant error for ${userId}:`, aiResponse.status, errBody);
-      return;
-    }
-
-    const data = await aiResponse.json();
-    const replyText = String(data?.reply || '').trim();
-    const images = Array.isArray(data?.images) ? data.images : [];
-
-    if (replyText) {
-      await sock.sendMessage(remoteJid, { text: replyText }, { quoted: msg });
-      recordHistory(remoteJid, 'user', text);
-      recordHistory(remoteJid, 'model', replyText);
-    }
-
-    for (const img of images) {
-      if (img?.url) {
-        await sock.sendMessage(remoteJid, {
-          image: { url: img.url },
-          caption: img.caption || '',
-        });
+    // Start sockets for pending or connected users
+    for (const row of sessions) {
+      if (row.phone_number && row.status !== "logged_out") {
+        await startSessionForUser(row);
       }
     }
   } catch (err) {
-    console.error(`Error handling WhatsApp message for ${userId}:`, err);
+    console.error("Session sync error:", err.message);
   }
 }
 
-async function stopUserSocket(userId) {
-  const entry = activeSockets.get(userId);
-  if (!entry) return;
-  try {
-    entry.sock?.end?.();
-  } catch {}
-  activeSockets.delete(userId);
-}
-
-async function startUserSocket(sessionRow) {
-  const userId = sessionRow.user_id;
-  const phoneNumber = sanitizePhone(sessionRow.phone_number);
-  if (!userId || !phoneNumber) return;
-
-  const existing = activeSockets.get(userId);
-  if (existing && (existing.isConnecting || existing.phoneNumber === phoneNumber)) {
-    existing.sessionConfig = sessionRow;
-    return;
-  }
-
-  await stopUserSocket(userId);
-
-  const authDir = path.join(AUTH_BASE_DIR, userId);
-  fs.mkdirSync(authDir, { recursive: true });
-
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await fetchLatestBaileysVersion();
-
-  const sock = makeWASocket({
-    version,
-    logger,
-    auth: state,
-    printQRInTerminal: false,
-    browser: ['Henymix', 'Chrome', '1.0.0'],
+app.get("/", (_req, res) => {
+  res.json({
+    status: "ok",
+    service: "henymix-wa-worker",
+    activeSockets: activeSockets.size
   });
+});
 
-  const entry = {
-    sock,
-    phoneNumber,
-    sessionConfig: sessionRow,
-    isConnecting: true,
-    pairingRequested: false,
-  };
-  activeSockets.set(userId, entry);
-
-  sock.ev.on('creds.update', saveCreds);
-
-  if (!state.creds.registered) {
-    const currentStatus = String(sessionRow.status || '').toLowerCase();
-    const hasExistingCode = Boolean(
-      sessionRow.pairing_code && String(sessionRow.pairing_code).trim()
-    );
-
-    if (currentStatus === 'pending' && !hasExistingCode && !entry.pairingRequested) {
-      entry.pairingRequested = true;
-      setTimeout(async () => {
-        try {
-          const code = await sock.requestPairingCode(phoneNumber);
-          const formatted = String(code || '').trim();
-          if (formatted) {
-            await supabase
-              .from('whatsapp_sessions')
-              .update({
-                pairing_code: formatted,
-                status: 'code_ready',
-                updated_at: new Date().toISOString(),
-              })
-              .eq('user_id', userId);
-          }
-        } catch (err) {
-          console.error(`Failed requesting pairing code for ${phoneNumber}:`, err);
-          entry.pairingRequested = false;
-        }
-      }, 2000);
-    }
-  } else {
-    entry.isConnecting = false;
-    await supabase
-      .from('whatsapp_sessions')
-      .update({
-        status: 'connected',
-        pairing_code: null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('user_id', userId);
-  }
-
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect } = update;
-    const latestEntry = activeSockets.get(userId);
-
-    if (connection === 'open') {
-      if (latestEntry) latestEntry.isConnecting = false;
-      await supabase
-        .from('whatsapp_sessions')
-        .update({
-          status: 'connected',
-          pairing_code: null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('user_id', userId);
-    } else if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
-
-      await stopUserSocket(userId);
-
-      if (loggedOut) {
-        fs.rmSync(authDir, { recursive: true, force: true });
-        await supabase
-          .from('whatsapp_sessions')
-          .update({
-            status: 'disconnected',
-            pairing_code: null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('user_id', userId);
-      } else {
-        setTimeout(() => {
-          syncSessions().catch(() => {});
-        }, 3000);
-      }
-    }
+app.get("/health", (_req, res) => {
+  res.json({
+    status: "ok",
+    service: "henymix-wa-worker",
+    activeSockets: activeSockets.size
   });
+});
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify' && type !== 'append') return;
-    const currentEntry = activeSockets.get(userId);
-    const cfg = currentEntry?.sessionConfig || sessionRow;
-
-    for (const msg of messages || []) {
-      await handleIncomingWhatsAppMessage(userId, cfg, sock, msg);
-    }
-  });
-}
-
-async function syncSessions() {
-  const { data: sessions, error } = await supabase
-    .from('whatsapp_sessions')
-    .select('*');
-
-  if (error) {
-    console.error('Error fetching whatsapp_sessions:', error.message);
-    return;
-  }
-
-  const activeRows = (sessions || []).filter((s) => sanitizePhone(s.phone_number).length >= 9);
-  const activeUserIds = new Set(activeRows.map((s) => s.user_id));
-
-  for (const [uid] of activeSockets.entries()) {
-    if (!activeUserIds.has(uid)) {
-      await stopUserSocket(uid);
-      const authDir = path.join(AUTH_BASE_DIR, uid);
-      fs.rmSync(authDir, { recursive: true, force: true });
-    }
-  }
-
-  for (const row of activeRows) {
-    await startUserSocket(row);
-  }
-}
-
-async function main() {
-  startHealthServer();
-  console.log('Henymix WhatsApp Worker started.');
-  await syncSessions();
-  setInterval(() => {
-    syncSessions().catch((err) => console.error('Poll error:', err));
-  }, POLL_INTERVAL_MS);
-}
-
-main();
+app.listen(PORT, () => {
+  console.log(`henymix-wa-worker listening on port ${PORT}`);
+  syncSessionsFromSupabase();
+  setInterval(syncSessionsFromSupabase, 15000);
+});
