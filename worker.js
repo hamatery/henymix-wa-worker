@@ -17,10 +17,13 @@ http
     console.log(`Health server listening on port ${PORT}`);
   });
 
-const SUPABASE_URL = (
-  process.env.SUPABASE_URL || "https://syxibiyrbgwsgghwwgej.supabase.co"
-).trim();
-const SUPABASE_SERVICE_ROLE_KEY = (
+const DEFAULT_SUPABASE_URL = "https://syxibiyrbgwsgghwwgej.supabase.co";
+const rawUrl = String(process.env.SUPABASE_URL || "").trim();
+const SUPABASE_URL = /^https?:\/\/.+/i.test(rawUrl)
+  ? rawUrl
+  : DEFAULT_SUPABASE_URL;
+
+const SUPABASE_SERVICE_ROLE_KEY = String(
   process.env.SUPABASE_SERVICE_ROLE_KEY || ""
 ).trim();
 const FUNCTION_URL = `${SUPABASE_URL}/functions/v1/yumilo-assistant`;
