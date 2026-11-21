@@ -1,12 +1,12 @@
 import http from 'http';
-import fs from 'fs';
-import path from 'path';
 import pino from 'pino';
 import { createClient } from '@supabase/supabase-js';
 import makeWASocket, {
-  useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  initAuthCreds,
+  BufferJSON,
+  proto,
 } from '@whiskeysockets/baileys';
 
 const PORT = process.env.PORT || 3000;
@@ -32,12 +32,6 @@ if (!SUPABASE_SERVICE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const logger = pino({ level: 'silent' });
-const AUTH_BASE_DIR = path.join(process.cwd(), 'auth_sessions');
-
-if (!fs.existsSync(AUTH_BASE_DIR)) {
-  fs.mkdirSync(AUTH_BASE_DIR, { recursive: true });
-}
-
 const activeSessions = new Map();
 
 function sanitizePhone(phone) {
@@ -58,13 +52,104 @@ async function updateSessionRow(userId, fields) {
   }
 }
 
+// Store Baileys auth state in Supabase site_settings so Render restarts never wipe sessions
+async function useSupabaseAuthState(userId, reset = false) {
+  const settingKey = `wa_auth_${userId}`;
+  let store = { creds: initAuthCreds(), keys: {} };
+
+  if (!reset) {
+    const { data } = await supabase
+      .from('site_settings')
+      .select('value')
+      .eq('key', settingKey)
+      .maybeSingle();
+
+    if (data?.value) {
+      try {
+        const raw = typeof data.value === 'string' ? data.value : JSON.stringify(data.value);
+        const parsed = JSON.parse(raw, BufferJSON.reviver);
+        if (parsed?.creds) {
+          store = { creds: parsed.creds, keys: parsed.keys || {} };
+        }
+      } catch (e) {
+        console.warn(`[${userId}] Could not parse stored auth state, starting fresh.`);
+      }
+    }
+  }
+
+  let saveTimeout = null;
+  const persist = async () => {
+    try {
+      const serialized = JSON.parse(JSON.stringify(store, BufferJSON.replacer));
+      await supabase.from('site_settings').upsert(
+        {
+          key: settingKey,
+          value: serialized,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'key' }
+      );
+    } catch (err) {
+      console.error(`[${userId}] Failed saving auth state to Supabase:`, err.message);
+    }
+  };
+
+  const schedulePersist = () => {
+    if (saveTimeout) clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(persist, 400);
+  };
+
+  if (reset) {
+    await persist();
+  }
+
+  return {
+    state: {
+      creds: store.creds,
+      keys: {
+        get: async (type, ids) => {
+          const result = {};
+          for (const id of ids) {
+            let value = store.keys[`${type}-${id}`] || null;
+            if (type === 'app-state-sync-key' && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            result[id] = value;
+          }
+          return result;
+        },
+        set: async (data) => {
+          for (const category in data) {
+            for (const id in data[category]) {
+              const value = data[category][id];
+              const k = `${category}-${id}`;
+              if (value) {
+                store.keys[k] = value;
+              } else {
+                delete store.keys[k];
+              }
+            }
+          }
+          schedulePersist();
+        },
+      },
+    },
+    saveCreds: async () => {
+      await persist();
+    },
+    clearState: async () => {
+      store = { creds: initAuthCreds(), keys: {} };
+      await supabase.from('site_settings').delete().eq('key', settingKey);
+    },
+  };
+}
+
 async function startSession(sessionRow, forceFreshPair = false) {
   const userId = sessionRow.user_id;
   const cleanPhone = sanitizePhone(sessionRow.phone_number);
 
   if (!cleanPhone || cleanPhone.length < 9) return;
 
-  // Prevent duplicate sockets for the exact same phone number across different user_ids
   for (const [otherUid, otherEntry] of activeSessions.entries()) {
     if (otherUid !== userId && otherEntry.phone === cleanPhone) {
       console.warn(`[${userId}] Skipping ${cleanPhone}: already active under user ${otherUid}`);
@@ -87,14 +172,11 @@ async function startSession(sessionRow, forceFreshPair = false) {
     } catch (_) {}
   }
 
-  const sessionDir = path.join(AUTH_BASE_DIR, userId);
   const phoneChanged = Boolean(prev && prev.phone && prev.phone !== cleanPhone);
-
-  if ((phoneChanged || forceFreshPair) && fs.existsSync(sessionDir)) {
-    fs.rmSync(sessionDir, { recursive: true, force: true });
-  }
-
-  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+  const { state, saveCreds, clearState } = await useSupabaseAuthState(
+    userId,
+    phoneChanged || forceFreshPair
+  );
   const { version } = await fetchLatestBaileysVersion();
 
   let pairingCodeRequested = false;
@@ -150,6 +232,7 @@ async function startSession(sessionRow, forceFreshPair = false) {
       console.log(`[${userId}] Connected to WhatsApp (${cleanPhone})`);
       sessionEntry.status = 'connected';
       pairingCodeRequested = false;
+      await saveCreds();
 
       await updateSessionRow(userId, {
         status: 'connected',
@@ -164,13 +247,10 @@ async function startSession(sessionRow, forceFreshPair = false) {
       console.log(`[${userId}] Connection closed (code: ${statusCode || 'unknown'})`);
 
       if (isLoggedOut) {
-        if (fs.existsSync(sessionDir)) {
-          fs.rmSync(sessionDir, { recursive: true, force: true });
-        }
+        await clearState();
         sessionEntry.status = 'disconnected';
         activeSessions.delete(userId);
 
-        // Set status to 'disconnected' so pollSessions does NOT endlessly spam new pairing codes
         await updateSessionRow(userId, {
           status: 'disconnected',
           pairing_code: null,
@@ -193,12 +273,35 @@ async function startSession(sessionRow, forceFreshPair = false) {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
+      if (!msg.message) continue;
 
       const remoteJid = msg.key.remoteJid || '';
       if (!remoteJid || remoteJid === 'status@broadcast') continue;
 
       const isGroup = remoteJid.endsWith('@g.us');
+      const myNumber = sanitizePhone(sock.user?.id?.split(':')[0] || cleanPhone);
+
+      const text =
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text ||
+        msg.message.imageMessage?.caption ||
+        msg.message.videoMessage?.caption ||
+        '';
+
+      if (!text.trim()) continue;
+
+      // Check if bot was directly @-tagged in a group via WhatsApp mention metadata
+      const mentionedJids =
+        msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
+      const isBotTagged = mentionedJids.some(
+        (jid) => sanitizePhone(jid.split('@')[0]) === myNumber
+      );
+
+      // Avoid infinite loops on own messages unless user explicitly tagged/called Henymix in self-chat or group
+      const lowerText = text.toLowerCase();
+      if (msg.key.fromMe && !isBotTagged && !lowerText.includes('henymix')) {
+        continue;
+      }
 
       const { data: latestRow } = await supabase
         .from('whatsapp_sessions')
@@ -210,36 +313,33 @@ async function startSession(sessionRow, forceFreshPair = false) {
       if (isGroup && latestRow.reply_in_groups === false) continue;
       if (!isGroup && latestRow.reply_in_dms === false) continue;
 
-      const text =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        msg.message.imageMessage?.caption ||
-        msg.message.videoMessage?.caption ||
-        '';
-
-      if (!text.trim()) continue;
-
       const keywords = (latestRow.trigger_keywords || '@henymix, henymix')
         .split(',')
         .map((k) => k.trim().toLowerCase())
         .filter(Boolean);
 
-      const lowerText = text.toLowerCase();
-      const matched =
-        keywords.length === 0 || keywords.some((kw) => lowerText.includes(kw));
+      const keywordMatched =
+        keywords.length === 0 ||
+        keywords.some((kw) => lowerText.includes(kw)) ||
+        lowerText.includes(`@${myNumber}`);
 
-      if (!matched) continue;
+      if (!isBotTagged && !keywordMatched) continue;
+
+      // Strip @<phone_number> tag from prompt so AI sees clean user question
+      const cleanedPrompt = text.replace(new RegExp(`@${myNumber}\\b`, 'g'), '').trim() || text;
 
       try {
         await sock.sendPresenceUpdate('composing', remoteJid);
+
+        const senderJid = isGroup ? (msg.key.participant || remoteJid) : remoteJid;
 
         const { data: fnData, error: fnError } = await supabase.functions.invoke(
           'yumilo-assistant',
           {
             body: {
-              message: text,
+              message: cleanedPrompt,
               user_id: userId,
-              sender: remoteJid,
+              sender: senderJid,
               is_group: isGroup,
               platform: 'whatsapp',
             },
@@ -293,7 +393,6 @@ async function pollSessions() {
       if (!cleanPhone) continue;
 
       const status = (row.status || '').toLowerCase();
-      // Do not auto-start disconnected or duplicate rows until the user clicks Request Real Link Code on the website
       if (status === 'disconnected' || status === 'duplicate_number') continue;
 
       const existing = activeSessions.get(row.user_id);
