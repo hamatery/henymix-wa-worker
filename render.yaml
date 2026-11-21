@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: henymix-wa-worker-2
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - fromGroup: henymix-wa-env
