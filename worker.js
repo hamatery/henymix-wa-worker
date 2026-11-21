@@ -38,6 +38,17 @@ function sanitizePhone(phone) {
   return String(phone || '').replace(/\D/g, '');
 }
 
+function formatForWhatsApp(text) {
+  return String(text || '')
+    // Convert ### Heading to WhatsApp *Heading*
+    .replace(/^#{1,6}\s+(.+)$/gm, (_, title) => `*${title.replace(/\*/g, '').trim()}*`)
+    // Convert **bold** to WhatsApp *bold*
+    .replace(/\*\*(.+?)\*\*/g, '*$1*')
+    // Convert Markdown "* " or "- " bullets to clean "• " bullets
+    .replace(/^\s*[\*\-]\s+/gm, '• ')
+    .trim();
+}
+
 async function updateSessionRow(userId, fields) {
   const { error } = await supabase
     .from('whatsapp_sessions')
@@ -253,7 +264,6 @@ async function startSession(sessionRow, forceFreshPair = false) {
 
       console.log(`[${userId}] Connection closed (code: ${statusCode || 'unknown'})`);
 
-      // Flush latest creds immediately before reconnecting on 515
       await saveCreds();
 
       if (isLoggedOut) {
@@ -363,7 +373,11 @@ async function startSession(sessionRow, forceFreshPair = false) {
           fnData?.reply || fnData?.response || fnData?.message || fnData?.text;
 
         if (replyText) {
-          await sock.sendMessage(remoteJid, { text: replyText }, { quoted: msg });
+          await sock.sendMessage(
+            remoteJid,
+            { text: formatForWhatsApp(replyText) },
+            { quoted: msg }
+          );
         }
       } catch (err) {
         console.error(`[${userId}] Auto-reply failed:`, err);
