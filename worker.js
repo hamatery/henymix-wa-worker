@@ -12,27 +12,52 @@ import path from "path";
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 10000;
+const DEFAULT_SUPABASE_URL = "https://syxibiyrbgwsgghwwgej.supabase.co";
+const PORT = Number(process.env.PORT) || 10000;
 
-const rawUrl =
-  process.env.SUPABASE_URL ||
-  process.env.NEXT_PUBLIC_SUPABASE_URL ||
-  process.env.VITE_SUPABASE_URL ||
-  "https://syxibiyrbgwsgghwwgej.supabase.co";
+function resolveSupabaseUrl() {
+  const candidates = [
+    process.env.SUPABASE_URL,
+    process.env.NEXT_PUBLIC_SUPABASE_URL,
+    process.env.VITE_SUPABASE_URL,
+    DEFAULT_SUPABASE_URL
+  ];
 
-const SUPABASE_URL = rawUrl.trim().replace(/^["']|["']$/g, "");
+  for (const raw of candidates) {
+    if (typeof raw !== "string") continue;
+    const cleaned = raw.trim().replace(/^["']+|["']+$/g, "").trim();
+    if (/^https?:\/\/.+/i.test(cleaned)) {
+      return cleaned.replace(/\/+$/, "");
+    }
+  }
 
-const rawKey =
-  process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  process.env.SUPABASE_KEY ||
-  process.env.SUPABASE_ANON_KEY ||
-  "";
+  return DEFAULT_SUPABASE_URL;
+}
 
-const SUPABASE_SERVICE_ROLE_KEY = rawKey.trim().replace(/^["']|["']$/g, "");
+function resolveSupabaseKey() {
+  const candidates = [
+    process.env.SUPABASE_SERVICE_ROLE_KEY,
+    process.env.SUPABASE_KEY,
+    process.env.SUPABASE_ANON_KEY
+  ];
+
+  for (const raw of candidates) {
+    if (typeof raw !== "string") continue;
+    const cleaned = raw.trim().replace(/^["']+|["']+$/g, "").trim();
+    if (cleaned.length > 0) {
+      return cleaned;
+    }
+  }
+
+  return "";
+}
+
+const SUPABASE_URL = resolveSupabaseUrl();
+const SUPABASE_SERVICE_ROLE_KEY = resolveSupabaseKey();
 const FUNCTION_URL = `${SUPABASE_URL}/functions/v1/yumilo-assistant`;
 
 if (!SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("Missing SUPABASE_SERVICE_ROLE_KEY in Render Environment Variables.");
+  console.error("Missing Supabase API key in Render Environment Variables.");
   process.exit(1);
 }
 
