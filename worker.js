@@ -9,7 +9,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
 } from '@whiskeysockets/baileys';
 
-// 1. Keep-alive HTTP health server for Render
+// 1. Health server for Render
 const PORT = process.env.PORT || 3000;
 http
   .createServer((req, res) => {
@@ -20,7 +20,7 @@ http
     console.log(`Health server listening on port ${PORT}`);
   });
 
-// 2. Supabase client setup
+// 2. Supabase setup
 const rawUrl = (process.env.SUPABASE_URL || '').trim();
 const SUPABASE_URL = rawUrl.startsWith('http')
   ? rawUrl
@@ -40,11 +40,22 @@ if (!fs.existsSync(AUTH_BASE_DIR)) {
   fs.mkdirSync(AUTH_BASE_DIR, { recursive: true });
 }
 
-// Track active sockets per user_id
+// Track active sessions by user_id
 const activeSessions = new Map();
 
 function sanitizePhone(phone) {
   return String(phone || '').replace(/\D/g, '');
+}
+
+async function updateSessionRow(userId, fields) {
+  const { error } = await supabase
+    .from('whatsapp_sessions')
+    .update(fields)
+    .eq('user_id', userId);
+
+  if (error) {
+    console.error(`[${userId}] Failed updating whatsapp_sessions:`, error.message);
+  }
 }
 
 async function startSession(sessionRow) {
@@ -56,18 +67,23 @@ async function startSession(sessionRow) {
     return;
   }
 
-  // Stop any existing socket for this user
-  const existing = activeSessions.get(userId);
-  if (existing?.sock) {
+  const prev = activeSessions.get(userId);
+  if (prev?.reconnectTimer) {
+    clearTimeout(prev.reconnectTimer);
+  }
+  if (prev?.sock) {
     try {
-      existing.sock.end(undefined);
+      prev.sock.ev.removeAllListeners('connection.update');
+      prev.sock.ev.removeAllListeners('creds.update');
+      prev.sock.ev.removeAllListeners('messages.upsert');
+      prev.sock.end(undefined);
     } catch (_) {}
   }
 
   const sessionDir = path.join(AUTH_BASE_DIR, userId);
+  const phoneChanged = Boolean(prev && prev.phone && prev.phone !== cleanPhone);
 
-  // Wipe old auth folder if phone number changed
-  if (existing && existing.phone !== cleanPhone && fs.existsSync(sessionDir)) {
+  if (phoneChanged && fs.existsSync(sessionDir)) {
     fs.rmSync(sessionDir, { recursive: true, force: true });
   }
 
@@ -80,18 +96,19 @@ async function startSession(sessionRow) {
     version,
     logger,
     auth: state,
-    // Canonical Linux Chrome identity required by WhatsApp pairing-code validation
     browser: ['Ubuntu', 'Chrome', '22.04.4'],
     printQRInTerminal: false,
     syncFullHistory: false,
     markOnlineOnConnect: false,
   });
 
-  activeSessions.set(userId, {
+  const sessionEntry = {
     sock,
     phone: cleanPhone,
-    status: 'connecting',
-  });
+    status: state.creds.registered ? 'connecting' : 'pending',
+    reconnectTimer: null,
+  };
+  activeSessions.set(userId, sessionEntry);
 
   sock.ev.on('creds.update', async () => {
     await saveCreds();
@@ -100,7 +117,7 @@ async function startSession(sessionRow) {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // Request pairing code once socket is ready (qr event fires) and not yet registered
+    // Request pairing code once socket is ready and account is not yet registered
     if (qr && !sock.authState.creds.registered && !pairingCodeRequested) {
       pairingCodeRequested = true;
       try {
@@ -111,32 +128,27 @@ async function startSession(sessionRow) {
             : rawCode;
 
         console.log(`[${userId}] Generated pairing code ${formattedCode} for ${cleanPhone}`);
+        sessionEntry.status = 'pending';
 
-        await supabase
-          .from('whatsapp_sessions')
-          .update({
-            pairing_code: formattedCode,
-            status: 'pending',
-          })
-          .eq('user_id', userId);
+        await updateSessionRow(userId, {
+          pairing_code: formattedCode,
+          status: 'pending',
+        });
       } catch (err) {
         pairingCodeRequested = false;
-        console.error(`[${userId}] Failed to request pairing code for ${cleanPhone}:`, err);
+        console.error(`[${userId}] Failed requesting pairing code:`, err);
       }
     }
 
     if (connection === 'open') {
       console.log(`[${userId}] Connected to WhatsApp (${cleanPhone})`);
-      const current = activeSessions.get(userId);
-      if (current) current.status = 'connected';
+      sessionEntry.status = 'connected';
+      pairingCodeRequested = false;
 
-      await supabase
-        .from('whatsapp_sessions')
-        .update({
-          status: 'connected',
-          pairing_code: null,
-        })
-        .eq('user_id', userId);
+      await updateSessionRow(userId, {
+        status: 'connected',
+        pairing_code: null,
+      });
     }
 
     if (connection === 'close') {
@@ -146,30 +158,36 @@ async function startSession(sessionRow) {
       console.log(`[${userId}] Connection closed (code: ${statusCode || 'unknown'})`);
 
       if (isLoggedOut) {
-        // Clear stale credentials and remove active tracking so a fresh link can happen
         if (fs.existsSync(sessionDir)) {
           fs.rmSync(sessionDir, { recursive: true, force: true });
         }
+        sessionEntry.status = 'disconnected';
         activeSessions.delete(userId);
 
-        await supabase
-          .from('whatsapp_sessions')
-          .update({
-            status: 'disconnected',
-            pairing_code: null,
-          })
-          .eq('user_id', userId);
-      } else {
-        // Reconnect immediately for 515 (restartRequired) after pairing, or brief delay otherwise
-        const delayMs = statusCode === DisconnectReason.restartRequired ? 500 : 3000;
-        setTimeout(() => {
-          startSession({ ...sessionRow, phone_number: cleanPhone });
-        }, delayMs);
+        await updateSessionRow(userId, {
+          status: 'disconnected',
+          pairing_code: null,
+        });
+        return;
       }
+
+      // Temporary disconnect or 515 restartRequired: keep 'connected' if already paired, reconnect cleanly
+      const wasConnected = sessionEntry.status === 'connected' || Boolean(sock.authState.creds.registered);
+      sessionEntry.status = wasConnected ? 'connected' : 'pending';
+
+      await updateSessionRow(userId, {
+        status: wasConnected ? 'connected' : 'pending',
+        ...(wasConnected ? { pairing_code: null } : {}),
+      });
+
+      const delayMs = statusCode === DisconnectReason.restartRequired ? 500 : 3000;
+      sessionEntry.reconnectTimer = setTimeout(() => {
+        startSession({ ...sessionRow, phone_number: cleanPhone });
+      }, delayMs);
     }
   });
 
-  // Handle incoming messages & trigger auto-reply
+  // Handle incoming messages and auto-reply via yumilo-assistant
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
@@ -177,9 +195,10 @@ async function startSession(sessionRow) {
       if (!msg.message || msg.key.fromMe) continue;
 
       const remoteJid = msg.key.remoteJid || '';
+      if (!remoteJid || remoteJid === 'status@broadcast') continue;
+
       const isGroup = remoteJid.endsWith('@g.us');
 
-      // Re-fetch latest toggles and trigger keywords from Supabase
       const { data: latestRow } = await supabase
         .from('whatsapp_sessions')
         .select('trigger_keywords, reply_in_groups, reply_in_dms')
@@ -246,7 +265,7 @@ async function startSession(sessionRow) {
   });
 }
 
-// 3. Poll whatsapp_sessions table every 5 seconds
+// 3. Poll whatsapp_sessions every 5 seconds without killing active sockets
 async function pollSessions() {
   try {
     const { data: rows, error } = await supabase
@@ -264,7 +283,7 @@ async function pollSessions() {
 
       const existing = activeSessions.get(row.user_id);
 
-      // Start a session if not running yet, or if the phone number changed
+      // Only start a new socket if none exists yet or phone_number changed
       if (!existing || existing.phone !== cleanPhone) {
         console.log(`[${row.user_id}] Starting WhatsApp session for ${cleanPhone}...`);
         await startSession(row);
