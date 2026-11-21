@@ -13,12 +13,26 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const rawUrl =
+  process.env.SUPABASE_URL ||
+  process.env.NEXT_PUBLIC_SUPABASE_URL ||
+  process.env.VITE_SUPABASE_URL ||
+  "https://syxibiyrbgwsgghwwgej.supabase.co";
+
+const SUPABASE_URL = rawUrl.trim().replace(/^["']|["']$/g, "");
+
+const rawKey =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  "";
+
+const SUPABASE_SERVICE_ROLE_KEY = rawKey.trim().replace(/^["']|["']$/g, "");
 const FUNCTION_URL = `${SUPABASE_URL}/functions/v1/yumilo-assistant`;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables.");
+if (!SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("Missing SUPABASE_SERVICE_ROLE_KEY in Render Environment Variables.");
   process.exit(1);
 }
 
