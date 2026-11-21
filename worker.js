@@ -52,55 +52,62 @@ async function updateSessionRow(userId, fields) {
   }
 }
 
-// Store Baileys auth state in Supabase site_settings so Render restarts never wipe sessions
-async function useSupabaseAuthState(userId, reset = false) {
-  const settingKey = `wa_auth_${userId}`;
+// Store Baileys auth state directly in whatsapp_sessions.auth_state (jsonb)
+async function useRowAuthState(userId, reset = false) {
   let store = { creds: initAuthCreds(), keys: {} };
 
   if (!reset) {
-    const { data } = await supabase
-      .from('site_settings')
-      .select('value')
-      .eq('key', settingKey)
+    const { data, error } = await supabase
+      .from('whatsapp_sessions')
+      .select('auth_state')
+      .eq('user_id', userId)
       .maybeSingle();
 
-    if (data?.value) {
+    if (error) {
+      console.error(`[${userId}] Error reading auth_state:`, error.message);
+    } else if (data?.auth_state) {
       try {
-        const raw = typeof data.value === 'string' ? data.value : JSON.stringify(data.value);
+        const raw =
+          typeof data.auth_state === 'string'
+            ? data.auth_state
+            : JSON.stringify(data.auth_state);
         const parsed = JSON.parse(raw, BufferJSON.reviver);
         if (parsed?.creds) {
           store = { creds: parsed.creds, keys: parsed.keys || {} };
         }
       } catch (e) {
-        console.warn(`[${userId}] Could not parse stored auth state, starting fresh.`);
+        console.warn(`[${userId}] Could not parse auth_state, starting fresh.`);
       }
     }
   }
 
-  let saveTimeout = null;
-  const persist = async () => {
+  let saveTimer = null;
+  const persistNow = async () => {
     try {
       const serialized = JSON.parse(JSON.stringify(store, BufferJSON.replacer));
-      await supabase.from('site_settings').upsert(
-        {
-          key: settingKey,
-          value: serialized,
+      const { error } = await supabase
+        .from('whatsapp_sessions')
+        .update({
+          auth_state: serialized,
           updated_at: new Date().toISOString(),
-        },
-        { onConflict: 'key' }
-      );
+        })
+        .eq('user_id', userId);
+
+      if (error) {
+        console.error(`[${userId}] Failed saving auth_state:`, error.message);
+      }
     } catch (err) {
-      console.error(`[${userId}] Failed saving auth state to Supabase:`, err.message);
+      console.error(`[${userId}] Exception saving auth_state:`, err.message);
     }
   };
 
   const schedulePersist = () => {
-    if (saveTimeout) clearTimeout(saveTimeout);
-    saveTimeout = setTimeout(persist, 400);
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(persistNow, 250);
   };
 
   if (reset) {
-    await persist();
+    await persistNow();
   }
 
   return {
@@ -135,11 +142,11 @@ async function useSupabaseAuthState(userId, reset = false) {
       },
     },
     saveCreds: async () => {
-      await persist();
+      await persistNow();
     },
     clearState: async () => {
       store = { creds: initAuthCreds(), keys: {} };
-      await supabase.from('site_settings').delete().eq('key', settingKey);
+      await updateSessionRow(userId, { auth_state: null });
     },
   };
 }
@@ -173,7 +180,7 @@ async function startSession(sessionRow, forceFreshPair = false) {
   }
 
   const phoneChanged = Boolean(prev && prev.phone && prev.phone !== cleanPhone);
-  const { state, saveCreds, clearState } = await useSupabaseAuthState(
+  const { state, saveCreds, clearState } = await useRowAuthState(
     userId,
     phoneChanged || forceFreshPair
   );
@@ -246,6 +253,9 @@ async function startSession(sessionRow, forceFreshPair = false) {
 
       console.log(`[${userId}] Connection closed (code: ${statusCode || 'unknown'})`);
 
+      // Flush latest creds immediately before reconnecting on 515
+      await saveCreds();
+
       if (isLoggedOut) {
         await clearState();
         sessionEntry.status = 'disconnected';
@@ -262,7 +272,7 @@ async function startSession(sessionRow, forceFreshPair = false) {
         sessionEntry.status === 'connected' || Boolean(sock.authState.creds.registered);
       sessionEntry.status = wasConnected ? 'connected' : 'awaiting_code';
 
-      const delayMs = statusCode === DisconnectReason.restartRequired ? 500 : 3000;
+      const delayMs = statusCode === DisconnectReason.restartRequired ? 300 : 3000;
       sessionEntry.reconnectTimer = setTimeout(() => {
         startSession({ ...sessionRow, phone_number: cleanPhone }, false);
       }, delayMs);
@@ -290,14 +300,12 @@ async function startSession(sessionRow, forceFreshPair = false) {
 
       if (!text.trim()) continue;
 
-      // Check if bot was directly @-tagged in a group via WhatsApp mention metadata
       const mentionedJids =
         msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
       const isBotTagged = mentionedJids.some(
         (jid) => sanitizePhone(jid.split('@')[0]) === myNumber
       );
 
-      // Avoid infinite loops on own messages unless user explicitly tagged/called Henymix in self-chat or group
       const lowerText = text.toLowerCase();
       if (msg.key.fromMe && !isBotTagged && !lowerText.includes('henymix')) {
         continue;
@@ -325,8 +333,8 @@ async function startSession(sessionRow, forceFreshPair = false) {
 
       if (!isBotTagged && !keywordMatched) continue;
 
-      // Strip @<phone_number> tag from prompt so AI sees clean user question
-      const cleanedPrompt = text.replace(new RegExp(`@${myNumber}\\b`, 'g'), '').trim() || text;
+      const cleanedPrompt =
+        text.replace(new RegExp(`@${myNumber}\\b`, 'g'), '').trim() || text;
 
       try {
         await sock.sendPresenceUpdate('composing', remoteJid);
@@ -401,7 +409,11 @@ async function pollSessions() {
       if (!existing || existing.phone !== cleanPhone) {
         console.log(`[${row.user_id}] Starting WhatsApp session for ${cleanPhone}...`);
         await startSession(row, wantsFreshCode);
-      } else if (wantsFreshCode && existing.status !== 'connected' && existing.status !== 'awaiting_code') {
+      } else if (
+        wantsFreshCode &&
+        existing.status !== 'connected' &&
+        existing.status !== 'awaiting_code'
+      ) {
         console.log(`[${row.user_id}] Fresh pairing code requested for ${cleanPhone}...`);
         await startSession(row, true);
       }
